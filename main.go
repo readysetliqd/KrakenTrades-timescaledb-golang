@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,9 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +29,17 @@ type Trade struct {
 	TradeID int64
 }
 
+// From the Kraken API docs: Every REST API user has a "call counter" which
+// starts at 0. Ledger/trade history calls increase the counter by 2. All other
+// API calls increase this counter by 1 (except AddOrder, CancelOrder which
+// operate on a different limiter detailed further below).
+// Tier: Starter 	  | Max Counter: 15 | API Counter Decay: -0.33/sec
+// Tier: Intermediate | Max Counter: 20 | API Counter Decay: -0.5/sec
+// Tier: Pro		  | Max Counter: 20 | API Counter Decay: -1/sec
+// This program calls for trade history but it is unclear whether the API docs
+// are referring to private trade history or public market data trade history
+const tradesRateLimit = 3000000000 // 1 / 0.33 * 1,000,000 (# nanosec in 1 sec)
+
 func main() {
 	err := godotenv.Load("env/psqllogin.env")
 	if err != nil {
@@ -42,14 +54,19 @@ func main() {
 	// Get pair since=last_entry
 	// loop until
 	// Write data into table
-	KrakenSpotPairs := GetKrakenSpotPairs()
+	KrakenSpotPairs, KrakenSpotAltPairs := GetKrakenSpotPairs()
 	var DesiredPair string
 	// TO DO:
+	// Bug: this doesn't actually do anything since pair is set by .env file
 	// Allow user to enter q for quit or ? for list of pairs
 	// Keep prompting user for inputs until pair is found in list of tradeable assets
 	for {
 		DesiredPair = strings.ToUpper(GetUserDesiredPair())
-		if PairExists(DesiredPair, KrakenSpotPairs) {
+		if PairExists(DesiredPair, KrakenSpotPairs) != -1 {
+			break
+		} else if i := PairExists(DesiredPair, KrakenSpotAltPairs); i != -1 {
+			DesiredPair = KrakenSpotPairs[i]
+			log.Printf("Altname for pair entered. Changing desired pair to %s", DesiredPair)
 			break
 		} else {
 			fmt.Println("Pair not found, try checking spelling or entering another pair.")
@@ -59,9 +76,11 @@ func main() {
 	// connect to postgres table
 	// required to create database outside of this program using Shell
 	// and create timescaledb extension if not exists
+	// TO DO:
+	// connect to db of desired pair or create db if it doesn't exist then
+	// remove DBNAME from .env and replace all
 	ctx := context.Background()
 	connStr := "postgres://" + os.Getenv("USER") + ":" + os.Getenv("PASS") + "@" + os.Getenv("HOST") + ":" + os.Getenv("PORT") + "/" + os.Getenv("DBNAME")
-	log.Println(connStr)
 	dbpool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
 		log.Printf("Unable to connect to database: %v\n", os.Stderr)
@@ -84,7 +103,7 @@ func main() {
 	}
 	log.Println(tableExists)
 
-	var querySince = 0
+	var querySince int64
 	// create hypertable if not exists
 	if !tableExists {
 		log.Println("Table does not exist. Creating table...")
@@ -110,66 +129,118 @@ func main() {
 			os.Exit(1)
 		}
 
-		infc := GetKrakenTrades(querySince)
-		tradesList := infc[Keys(infc)[0]].([]interface{})
-		tradesListLength := len(tradesList)
-		var trades []Trade
-		for _, el := range tradesList {
-			var t Trade
-			t.Time = int64(el.([]interface{})[2].(float64) * math.Pow(10, 9))
-			t.Price, err = strconv.ParseFloat(el.([]interface{})[0].(string), 64)
-			if err != nil {
-				log.Fatal("Error parsing string to float")
+		// set querySince to 0 for new table and begin loop to insert data
+		querySince = 0
+		estCompletionTime(0, DesiredPair)
+		for {
+			tradesInfc := GetKrakenTrades(querySince)
+			tradesList := tradesInfc[DesiredPair].([]interface{})
+			tradesListLength := len(tradesList)
+			insertTradesToDb(tradesList, ctx, dbpool, tableName)
+			if tradesListLength != 1000 {
+				log.Println("Trades database is up to date")
+				break
 			}
-			t.Volume, err = strconv.ParseFloat(el.([]interface{})[1].(string), 64)
+			querySince, err = strconv.ParseInt(tradesInfc["last"].(string), 0, 64)
+			querySince = querySince + 1
 			if err != nil {
-				log.Fatal("Error parsing string to float")
+				log.Fatal("Error parsing int64 from string")
 			}
-			t.Side = el.([]interface{})[3].(string)
-			t.Type = el.([]interface{})[4].(string)
-			t.Misc = el.([]interface{})[5].(string)
-			t.TradeID = int64(el.([]interface{})[6].(float64))
-			trades = append(trades, t)
+			time.Sleep(tradesRateLimit)
 		}
-		queryInsertData := `
-			INSERT INTO ` + tableName + ` (time, price, volume, side, type, misc, trade_id) VALUES ($1, $2, $3, $4, $5, $6, $7);
-			`
-		batch := &pgx.Batch{}
-		for i := range trades {
-			t := trades[i]
-			batch.Queue(queryInsertData, t.Time, t.Price, t.Volume, t.Side, t.Type, t.Misc, t.TradeID)
-		}
-		batch.Queue("SELECT count(*) from " + tableName)
-
-		br := dbpool.SendBatch(ctx, batch)
-		_, err = br.Exec()
-		if err != nil {
-			log.Fatalf("Unable to execute statement in batch queue %v\n", err)
-		}
-
-		if tradesListLength != 1000 {
-			log.Println("Trades database up to date")
-		}
-		log.Println("Successfully batch inserted data")
-		err = br.Close()
-		if err != nil {
-			log.Fatalf("Unable to close batch %v\n", err)
-		}
-	} else {
+	} else { // update database if hypertable exists
 		log.Println("Table already exists. Fetching last entry...")
-		var lastTime int64
-		dbpool.QueryRow(ctx, "SELECT time FROM xbtusd_kraken_trades order by trade_id desc limit 1;").Scan(&lastTime)
-		log.Println(lastTime)
+		// set querySince to last entry in database and begin loop to insert data
+		dbpool.QueryRow(ctx, "SELECT time FROM xbtusd_kraken_trades order by trade_id desc limit 1;").Scan(&querySince)
+		var lastTradeId int64
+		dbpool.QueryRow(ctx, "SELECT trade_id FROM xbtusd_kraken_trades ORDER BY trade_id desc limit 1;").Scan(&lastTradeId)
+		estCompletionTime(lastTradeId, DesiredPair)
+		for {
+			tradesInfc := GetKrakenTrades(querySince)
+			tradesList := tradesInfc[DesiredPair].([]interface{})
+			tradesListLength := len(tradesList)
+			insertTradesToDb(tradesList, ctx, dbpool, tableName)
+			if tradesListLength != 1000 {
+				log.Println("Trades database is up to date")
+				break
+			}
+			querySince, err = strconv.ParseInt(tradesInfc["last"].(string), 0, 64)
+			querySince = querySince + 1
+			if err != nil {
+				log.Fatal("Error parsing int64 from string")
+			}
+			time.Sleep(tradesRateLimit)
+		}
 	}
 }
 
-// Kraken trades API gives time as a floating point decimal. This function
-// returns two ints, one of the integral and one of the fractional part of the
-// decimal.
-func KrakenSplitDecimal(unixTime float64) (int64, int64) {
-	sec := int64(math.Floor(unixTime))
-	nsec := int64((unixTime - float64(sec)) * 1000000000)
-	return sec, nsec
+func estCompletionTime(last int64, pair string) {
+	apiQuery := "https://api.kraken.com/0/public/Trades?pair=XBTUSD&count=1"
+	res, err := http.Get(apiQuery)
+	if err != nil {
+		log.Fatal("http.Get error | ", err)
+	}
+	defer res.Body.Close()
+
+	resp := map[string]interface{}{}
+	var msg = []byte{}
+	msg, err = io.ReadAll(res.Body)
+	if err != nil {
+		log.Fatal("io.ReadAll error | ", err)
+	}
+
+	json.Unmarshal(msg, &resp)
+	tradesLeft := int64((resp["result"].(map[string]interface{})[pair].([]interface{})[0].([]interface{})[6].(float64))) - last
+	totalSec := tradesLeft * tradesRateLimit / 1000000000 / 1000 // convert from nanoseconds to seconds and 1000 entries per API response
+	estDay := totalSec / 86400
+	estHr := (totalSec - estDay*86400) / 3600
+	estMin := (totalSec - estDay*86400 - estHr*3600) / 60
+	fmt.Printf("Estimated time to complete with current rate limit is %v days %v hours %v minutes\n", estDay, estHr, estMin)
+	fmt.Print("Press 'Enter' to continue...")
+	bufio.NewReader(os.Stdin).ReadBytes('\n')
+}
+
+func insertTradesToDb(tradesList []interface{}, ctx context.Context, dbpool *pgxpool.Pool, tableName string) {
+	var trades []Trade
+	var err error
+	for _, el := range tradesList {
+		var t Trade
+		t.Time = int64(el.([]interface{})[2].(float64) * math.Pow(10, 9))
+		t.Price, err = strconv.ParseFloat(el.([]interface{})[0].(string), 64)
+		if err != nil {
+			log.Fatal("Error parsing string to float")
+		}
+		t.Volume, err = strconv.ParseFloat(el.([]interface{})[1].(string), 64)
+		if err != nil {
+			log.Fatal("Error parsing string to float")
+		}
+		t.Side = el.([]interface{})[3].(string)
+		t.Type = el.([]interface{})[4].(string)
+		t.Misc = el.([]interface{})[5].(string)
+		t.TradeID = int64(el.([]interface{})[6].(float64))
+		trades = append(trades, t)
+	}
+	queryInsertData := `
+		INSERT INTO ` + tableName + ` (time, price, volume, side, type, misc, trade_id) VALUES ($1, $2, $3, $4, $5, $6, $7);
+		`
+	batch := &pgx.Batch{}
+	for i := range trades {
+		t := trades[i]
+		batch.Queue(queryInsertData, t.Time, t.Price, t.Volume, t.Side, t.Type, t.Misc, t.TradeID)
+	}
+	batch.Queue("SELECT count(*) from " + tableName)
+
+	br := dbpool.SendBatch(ctx, batch)
+	_, err = br.Exec()
+	if err != nil {
+		log.Fatalf("Unable to execute statement in batch queue %v\n", err)
+	}
+
+	log.Println("Successfully batch inserted data")
+	err = br.Close()
+	if err != nil {
+		log.Fatalf("Unable to close batch %v\n", err)
+	}
 }
 
 // Returns slice containing all keys of a map[string]interface
@@ -183,8 +254,8 @@ func Keys(m map[string]interface{}) []string {
 	return keys
 }
 
-func GetKrakenTrades(since int) map[string]interface{} {
-	apiQuery := "https://api.kraken.com/0/public/Trades?pair=XBTUSD&since=" + strconv.Itoa(since)
+func GetKrakenTrades(since int64) map[string]interface{} {
+	apiQuery := "https://api.kraken.com/0/public/Trades?pair=XBTUSD&since=" + strconv.Itoa(int(since))
 	res, err := http.Get(apiQuery)
 	if err != nil {
 		log.Fatal("http.Get error | ", err)
@@ -202,14 +273,15 @@ func GetKrakenTrades(since int) map[string]interface{} {
 	return resp["result"].(map[string]interface{})
 }
 
-// Checks if input_pair (string) is in slice of pairs, returns true if it exists
-func PairExists(input_pair string, pairs []string) bool {
-	for _, pair := range pairs {
+// Checks if input_pair (string) is in slice of pairs, returns -1 if it doesn't
+// exist otherwise returns index where pair was found
+func PairExists(input_pair string, pairs []string) int {
+	for i, pair := range pairs {
 		if pair == input_pair {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 // Prompts user for input (string) for desired pair and returns pair (string)
@@ -220,9 +292,9 @@ func GetUserDesiredPair() string {
 	return pair
 }
 
-// Requests Kraken REST API for tradeable asset pairs and returns all pairs in
-// a slice KrakenPairsList ([]string)
-func GetKrakenSpotPairs() []string {
+// Polls Kraken REST API for tradeable asset pairs and returns two slices ([]string)
+// of their pair names and altnames
+func GetKrakenSpotPairs() ([]string, []string) {
 	res, err := http.Get("https://api.kraken.com/0/public/AssetPairs")
 	if err != nil {
 		log.Fatal("http.Get error | ", err)
@@ -237,14 +309,16 @@ func GetKrakenSpotPairs() []string {
 	}
 
 	var KrakenPairsList []string
+	var KrakenPairsAltList []string
 	json.Unmarshal(msg, &resp)
-	for _, el := range resp["result"].(map[string]interface{}) {
-		KrakenPairsList = append(KrakenPairsList, el.(map[string]interface{})["altname"].(string))
+	for k, el := range resp["result"].(map[string]interface{}) {
+		KrakenPairsList = append(KrakenPairsList, k)
+		KrakenPairsAltList = append(KrakenPairsAltList, el.(map[string]interface{})["altname"].(string))
 	}
-	sort.Slice(KrakenPairsList, func(i, j int) bool {
-		return KrakenPairsList[i] < KrakenPairsList[j]
-	})
 	// DEBUG
+	// sort.Slice(KrakenPairsAltList, func(i, j int) bool {
+	// 	return KrakenPairsAltList[i] < KrakenPairsAltList[j]
+	// })
 	// log.Println(KrakenPairsList)
-	return KrakenPairsList
+	return KrakenPairsList, KrakenPairsAltList
 }
