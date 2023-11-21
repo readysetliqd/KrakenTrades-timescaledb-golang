@@ -45,42 +45,25 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-	// TO DO:
-	// If table for pair !exists
-	// Get first data for pair since=0
-	// loop until last=current_time ? last won't ever be current time...
-	// loop until api sends number of trades less than 1000?
-	// If table for pair exists
-	// Get pair since=last_entry
-	// loop until
-	// Write data into table
 	KrakenSpotPairs, KrakenSpotAltPairs := GetKrakenSpotPairs()
-	var DesiredPair string
-	// TO DO:
-	// Bug: this doesn't actually do anything since pair is set by .env file
-	// Allow user to enter q for quit or ? for list of pairs
-	// Keep prompting user for inputs until pair is found in list of tradeable assets
-	for {
-		DesiredPair = strings.ToUpper(GetUserDesiredPair())
-		if PairExists(DesiredPair, KrakenSpotPairs) != -1 {
-			break
-		} else if i := PairExists(DesiredPair, KrakenSpotAltPairs); i != -1 {
-			DesiredPair = KrakenSpotPairs[i]
-			log.Printf("Altname for pair entered. Changing desired pair to %s", DesiredPair)
-			break
-		} else {
-			fmt.Println("Pair not found, try checking spelling or entering another pair.")
-		}
+	var desiredPair string
+	// validate DBNAME in .env file is a tradeable pair on kraken
+	desiredPair = strings.ToUpper(os.Getenv("DBNAME"))
+	dbName := strings.ToLower(desiredPair)
+	if PairExists(desiredPair, KrakenSpotPairs) != -1 {
+		log.Printf("Found pair")
+	} else if i := PairExists(desiredPair, KrakenSpotAltPairs); i != -1 {
+		desiredPair = KrakenSpotPairs[i]
+		log.Printf("Altname for pair entered. Changing desired pair to %s", desiredPair)
+	} else {
+		fmt.Println("Pair not found, try checking spelling or entering another pair.")
 	}
 
-	// connect to postgres table
-	// required to create database outside of this program using Shell
-	// and create timescaledb extension if not exists
-	// TO DO:
-	// connect to db of desired pair or create db if it doesn't exist then
-	// remove DBNAME from .env and replace all
+	// connect to postgres db
+	// prerequisite to create database of same name as entered into psqllogin.env
+	// outside of this program before running
 	ctx := context.Background()
-	connStr := "postgres://" + os.Getenv("USER") + ":" + os.Getenv("PASS") + "@" + os.Getenv("HOST") + ":" + os.Getenv("PORT") + "/" + os.Getenv("DBNAME")
+	connStr := "postgres://" + os.Getenv("USER") + ":" + os.Getenv("PASS") + "@" + os.Getenv("HOST") + ":" + os.Getenv("PORT") + "/" + dbName
 	dbpool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
 		log.Printf("Unable to connect to database: %v\n", os.Stderr)
@@ -90,7 +73,7 @@ func main() {
 
 	// check if table exists with dbname
 	var tableExists bool
-	tableName := os.Getenv("DBNAME") + "_kraken_trades"
+	tableName := dbName + "_kraken_trades"
 	queryTableExists := `SELECT EXISTS (
 		SELECT 1
 		FROM information_schema.tables
@@ -122,6 +105,12 @@ func main() {
 			log.Printf("Unable to create the '%s' table: %v\n", tableName, err)
 			os.Exit(1)
 		}
+		queryUpgradeDbToTimescale := "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+		_, err = dbpool.Exec(ctx, queryUpgradeDbToTimescale)
+		if err != nil {
+			log.Printf("Unable to create timescaledb extension '%s': %v\n", dbName, err)
+			os.Exit(1)
+		}
 		queryCreateHypertable := `SELECT create_hypertable('` + tableName + `', 'time', chunk_time_interval => 86400000000000);`
 		_, err = dbpool.Exec(ctx, queryCreateHypertable)
 		if err != nil {
@@ -131,10 +120,10 @@ func main() {
 
 		// set querySince to 0 for new table and begin loop to insert data
 		querySince = 0
-		estCompletionTime(0, DesiredPair)
+		estCompletionTime(0, desiredPair)
 		for {
-			tradesInfc := GetKrakenTrades(querySince)
-			tradesList := tradesInfc[DesiredPair].([]interface{})
+			tradesInfc := GetKrakenTrades(querySince, desiredPair)
+			tradesList := tradesInfc[desiredPair].([]interface{})
 			tradesListLength := len(tradesList)
 			insertTradesToDb(tradesList, ctx, dbpool, tableName)
 			if tradesListLength != 1000 {
@@ -151,13 +140,13 @@ func main() {
 	} else { // update database if hypertable exists
 		log.Println("Table already exists. Fetching last entry...")
 		// set querySince to last entry in database and begin loop to insert data
-		dbpool.QueryRow(ctx, "SELECT time FROM xbtusd_kraken_trades order by trade_id desc limit 1;").Scan(&querySince)
+		dbpool.QueryRow(ctx, "SELECT time FROM "+dbName+"_kraken_trades order by trade_id desc limit 1;").Scan(&querySince)
 		var lastTradeId int64
-		dbpool.QueryRow(ctx, "SELECT trade_id FROM xbtusd_kraken_trades ORDER BY trade_id desc limit 1;").Scan(&lastTradeId)
-		estCompletionTime(lastTradeId, DesiredPair)
+		dbpool.QueryRow(ctx, "SELECT trade_id FROM "+dbName+"_kraken_trades ORDER BY trade_id desc limit 1;").Scan(&lastTradeId)
+		estCompletionTime(lastTradeId, desiredPair)
 		for {
-			tradesInfc := GetKrakenTrades(querySince)
-			tradesList := tradesInfc[DesiredPair].([]interface{})
+			tradesInfc := GetKrakenTrades(querySince, desiredPair)
+			tradesList := tradesInfc[desiredPair].([]interface{})
 			tradesListLength := len(tradesList)
 			insertTradesToDb(tradesList, ctx, dbpool, tableName)
 			if tradesListLength != 1000 {
@@ -175,7 +164,7 @@ func main() {
 }
 
 func estCompletionTime(last int64, pair string) {
-	apiQuery := "https://api.kraken.com/0/public/Trades?pair=XBTUSD&count=1"
+	apiQuery := "https://api.kraken.com/0/public/Trades?pair=" + pair + "&count=1"
 	res, err := http.Get(apiQuery)
 	if err != nil {
 		log.Fatal("http.Get error | ", err)
@@ -254,8 +243,8 @@ func Keys(m map[string]interface{}) []string {
 	return keys
 }
 
-func GetKrakenTrades(since int64) map[string]interface{} {
-	apiQuery := "https://api.kraken.com/0/public/Trades?pair=XBTUSD&since=" + strconv.Itoa(int(since))
+func GetKrakenTrades(since int64, pair string) map[string]interface{} {
+	apiQuery := "https://api.kraken.com/0/public/Trades?pair=" + pair + "&since=" + strconv.Itoa(int(since))
 	res, err := http.Get(apiQuery)
 	if err != nil {
 		log.Fatal("http.Get error | ", err)
@@ -282,14 +271,6 @@ func PairExists(input_pair string, pairs []string) int {
 		}
 	}
 	return -1
-}
-
-// Prompts user for input (string) for desired pair and returns pair (string)
-func GetUserDesiredPair() string {
-	fmt.Println("Enter desired pair: ")
-	var pair string
-	fmt.Scanln(&pair)
-	return pair
 }
 
 // Polls Kraken REST API for tradeable asset pairs and returns two slices ([]string)
